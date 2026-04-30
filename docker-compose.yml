@@ -1,0 +1,237 @@
+# =============================================================================
+# AeroCache — Docker Compose Orchestration
+# =============================================================================
+#
+# Cluster topology:
+#
+#   [aerocache-ai]          Python FastAPI + IsolationForest (port 8000)
+#        ↑ depends_on (healthy)
+#   [node-1] MASTER ──── replicates ──▶ [node-2] SLAVE   (pair A, ports 6001/6002)
+#   [node-3] MASTER ──── replicates ──▶ [node-4] SLAVE   (pair B, ports 6003/6004)
+#        ↑ depends_on (healthy)
+#
+# Heartbeat monitoring (slave watches master):
+#   node-2 monitors node-1  (PEER_HOST=node-1, PEER_PORT=6001)
+#   node-4 monitors node-3  (PEER_HOST=node-3, PEER_PORT=6003)
+#
+# Network:
+#   All services join the custom bridge network "aerocache-net".
+#   Containers resolve each other by service name (e.g. "node-1", "node-2"),
+#   which is why PEER_HOST and AI_HOST use service names, not IP addresses.
+#
+# Startup order:
+#   1. aerocache-ai starts and passes its /health probe.
+#   2. node-1 and node-3 (masters) start — they depend on aerocache-ai being healthy.
+#   3. node-2 and node-4 (slaves) start — they depend on their respective masters.
+#
+# Usage:
+#   docker compose up --build          # build images and start the cluster
+#   docker compose up --build -d       # detached mode
+#   docker compose logs -f node-1      # tail logs for a specific node
+#   docker compose down                # stop and remove containers
+#
+# Demo commands (after cluster is up):
+#   # Set a key via telnet (CRLF protocol)
+#   echo -e "SET greeting Hello, AeroCache!\r" | nc localhost 6001
+#   echo -e "GET greeting\r" | nc localhost 6001
+#   echo -e "DEL greeting\r" | nc localhost 6001
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # AI Eviction Microservice
+  # ---------------------------------------------------------------------------
+  aerocache-ai:
+    build:
+      context: ./aerocache-ai      # directory containing the Python Dockerfile
+      dockerfile: Dockerfile
+    container_name: aerocache-ai
+    networks:
+      - aerocache-net
+    ports:
+      # Expose on host port 8000 for direct testing via curl / Postman.
+      # Other containers use the service name "aerocache-ai" on port 8000
+      # internally — they do NOT go through the host port mapping.
+      - "8000:8000"
+    restart: unless-stopped
+
+    # ── Health check ────────────────────────────────────────────────────────
+    # Docker Compose uses this to determine when the AI service is truly ready
+    # before starting the master nodes (which depend on it being "healthy").
+    #
+    # interval:     Probe every 5 s.
+    # timeout:      Fail the probe if /health takes > 3 s (handles cold start).
+    # retries:      Mark unhealthy after 3 consecutive failures.
+    # start_period: Give Uvicorn + scikit-learn warm-up 15 s before counting
+    #               failures — prevents false-negatives during sklearn import.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+
+  # ---------------------------------------------------------------------------
+  # Node 1 — Master of Pair A
+  # ---------------------------------------------------------------------------
+  node-1:
+    build:
+      context: ./aerocache-node
+      dockerfile: Dockerfile
+    container_name: aerocache-node-1
+    networks:
+      - aerocache-net
+    ports:
+      # Published to the host so the Smart Client or telnet can reach it directly.
+      - "6001:6001"
+    restart: unless-stopped
+
+    # ── Dependency chain ────────────────────────────────────────────────────
+    # node-1 must not start until aerocache-ai passes its healthcheck.
+    # Rationale: AIEvictionPolicy fires on the very first SET that exceeds
+    # capacity.  If the AI service isn't ready yet, the Java node falls back
+    # to LRU — which is safe, but we prefer the AI service to be warm first.
+    depends_on:
+      aerocache-ai:
+        condition: service_healthy
+
+    # ── Runtime environment ─────────────────────────────────────────────────
+    # Variables read by aerocache.Main via System.getenv().
+    environment:
+      # Network identity of this node (used as the ConsistentHashRing seed).
+      NODE_HOST:      node-1
+      CACHE_PORT:     6001
+      CACHE_ROLE:     MASTER
+      CACHE_CAPACITY: 10000
+
+      # Peer node (the slave in this pair).
+      # ReplicationManager opens a TCPClient to node-2:6002 and forwards
+      # every SET/DEL asynchronously.
+      PEER_HOST:      node-2
+      PEER_PORT:      6002
+
+      # AI microservice — resolved by Docker's internal DNS using the service name.
+      AI_HOST:        aerocache-ai
+      AI_PORT:        8000
+      AI_ENABLED:     "true"
+
+
+  # ---------------------------------------------------------------------------
+  # Node 2 — Slave of Node 1 (Pair A replica)
+  # ---------------------------------------------------------------------------
+  node-2:
+    build:
+      context: ./aerocache-node
+      dockerfile: Dockerfile
+    container_name: aerocache-node-2
+    networks:
+      - aerocache-net
+    ports:
+      - "6002:6002"
+    restart: unless-stopped
+
+    # Slave must start after the master it monitors is already up.
+    # We use service_started (not service_healthy) because node-1 doesn't
+    # have its own healthcheck — started means the container process launched.
+    depends_on:
+      node-1:
+        condition: service_started
+
+    environment:
+      NODE_HOST:      node-2
+      CACHE_PORT:     6002
+      CACHE_ROLE:     SLAVE
+      CACHE_CAPACITY: 10000
+
+      # Peer is the MASTER this slave watches via HeartbeatService.
+      # 3 consecutive missed PINGs to node-1:6001 → node-2 promotes itself.
+      PEER_HOST:      node-1
+      PEER_PORT:      6001
+
+      # Slaves receive writes via REPLICATE — they don't call the AI service.
+      # AI_ENABLED=false means LRU eviction is used on the slave's own cache
+      # (relevant only if the slave promotes itself and starts accepting writes).
+      AI_HOST:        aerocache-ai
+      AI_PORT:        8000
+      AI_ENABLED:     "false"
+
+
+  # ---------------------------------------------------------------------------
+  # Node 3 — Master of Pair B
+  # ---------------------------------------------------------------------------
+  node-3:
+    build:
+      context: ./aerocache-node
+      dockerfile: Dockerfile
+    container_name: aerocache-node-3
+    networks:
+      - aerocache-net
+    ports:
+      - "6003:6003"
+    restart: unless-stopped
+
+    depends_on:
+      aerocache-ai:
+        condition: service_healthy
+
+    environment:
+      NODE_HOST:      node-3
+      CACHE_PORT:     6003
+      CACHE_ROLE:     MASTER
+      CACHE_CAPACITY: 10000
+
+      PEER_HOST:      node-4
+      PEER_PORT:      6004
+
+      AI_HOST:        aerocache-ai
+      AI_PORT:        8000
+      AI_ENABLED:     "true"
+
+
+  # ---------------------------------------------------------------------------
+  # Node 4 — Slave of Node 3 (Pair B replica)
+  # ---------------------------------------------------------------------------
+  node-4:
+    build:
+      context: ./aerocache-node
+      dockerfile: Dockerfile
+    container_name: aerocache-node-4
+    networks:
+      - aerocache-net
+    ports:
+      - "6004:6004"
+    restart: unless-stopped
+
+    depends_on:
+      node-3:
+        condition: service_started
+
+    environment:
+      NODE_HOST:      node-4
+      CACHE_PORT:     6004
+      CACHE_ROLE:     SLAVE
+      CACHE_CAPACITY: 10000
+
+      # Watches node-3 — promotes itself if node-3 stops heartbeating.
+      PEER_HOST:      node-3
+      PEER_PORT:      6003
+
+      AI_HOST:        aerocache-ai
+      AI_PORT:        8000
+      AI_ENABLED:     "false"
+
+
+# =============================================================================
+# Network
+# =============================================================================
+networks:
+  aerocache-net:
+    # Custom bridge network — each container gets a DNS entry matching its
+    # service name (node-1, node-2, aerocache-ai, etc.).
+    # Without a custom network, containers on the default bridge cannot
+    # resolve each other by name — they would need to use raw IP addresses,
+    # which are assigned dynamically and not predictable.
+    driver: bridge
+    name: aerocache-net
